@@ -1,0 +1,393 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Generate Rightsizing Recommendation reports, save 2 CSVs in S3 and send SNS notification to teams.
+
+Parameters:
+
+  RightsizingBucketName:
+    Type: String
+    Description: S3 bucket name
+    Default: <s3-bucket-name>
+
+  RightsizingLambdaRoleName:
+    Type: String
+    Description: Lambda role name
+    Default: <lambda-role-name>
+
+  RightsizingLambdaName:
+    Type: String
+    Description: Lambda name
+    Default: <lambda-name>
+
+  RightsizingCloudWatchGroupPrefix:
+    Type: String
+    Default: /aws/lambda
+
+  RightsizingSNSTopicName:
+    Type: String
+    Description: SNS topic name
+    Default: <sns-topic-name>
+
+  RightsizingSNSSubscription1:
+    Type: String
+    Description: Email address
+    Default: <email-address>
+
+  RightsizingSNSSubscription2:
+    Type: String
+    Description: HTTPS endpoint
+    Default: <https-endpoint>
+
+  RightsizingEventBridge:
+    Type: String
+    Description: EventBridge rule name
+    Default: <EventBridge-rule-name>
+
+Resources:
+
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref RightsizingBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      VersioningConfiguration:
+        Status: "Suspended"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: BucketOwnerFullControl
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition to Glacier after 90 days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: Delete-Incomplete-MPU-7Days
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: Expire and delete after 5 years
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 1825
+            NoncurrentVersionExpiration: 
+              NoncurrentDays: 1
+
+  RightsizingLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RightsizingLambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: "CLoudWatch"
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: "S3"
+                Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${RightsizingBucketName}/*'
+              - Sid: "CostExplorer"
+                Effect: Allow
+                Action:
+                  - "ce:List*"
+                  - "ce:Describe*"
+                  - "ce:Get*"
+                Resource: "*" 
+              - Sid: "IAM"
+                Effect: Allow
+                Action:
+                  - "iam:List*"
+                Resource: "*" 
+              - Sid: "Organization"
+                Effect: Allow
+                Action:
+                  - "organizations:ListAccounts"
+                  - "organizations:DescribeAccount"
+                Resource: "*" 
+              - Sid: "SNS"
+                Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: "arn:aws:sns:*:*:*" 
+
+  RightsizingSnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: !Ref RightsizingSNSTopicName
+      Subscription:
+        - Endpoint: !Ref RightsizingSNSSubscription1
+          Protocol: "email"
+        - Endpoint: !Ref RightsizingSNSSubscription2
+          Protocol: "https"
+
+  RightsizingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 
+        Fn::Join:
+          - ""
+          - 
+            - !Ref RightsizingCloudWatchGroupPrefix
+            - "/"
+            - !Ref RightsizingLambdaName
+      RetentionInDays: 90
+
+  RightsizingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref RightsizingLambdaName
+      Description: "Generate 2 rightsizing reports (a detailed and a summarized one) on the first Monday morning of each month."
+      Code:
+        ZipFile:
+          !Sub |
+          import boto3
+          import csv
+          import datetime
+          import os
+
+          sns = boto3.client('sns')
+
+          def flatten_dict(d, parent_key='', sep='_'):
+              items = []
+              for k, v in d.items():
+                  new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                  if isinstance(v, dict):
+                      items.extend(flatten_dict(v, new_key, sep=sep).items())
+                  else:
+                      items.append((new_key, v))
+              return dict(items)
+
+          def get_account_alias(account_id):
+              org_client = boto3.client('organizations')
+              try:
+                  response = org_client.describe_account(AccountId=account_id)
+                  return response['Account']['Name']
+              except Exception as e:
+                  print(f"Error getting account alias: {str(e)}")
+                  return ''
+
+          def extract_savings_from_target_instances(target_instances):
+              if isinstance(target_instances, list) and target_instances:
+                  # Assuming the first item in the list contains the EstimatedMonthlySavings
+                  return target_instances[0].get('EstimatedMonthlySavings', '')
+              return ''
+
+          def extract_instance_type_from_target_instances(target_instances):
+              if isinstance(target_instances, list) and target_instances:
+                  # Assuming the first item in the list contains the InstanceType
+                  resource_details = target_instances[0].get('ResourceDetails', {})
+                  ec2_resource_details = resource_details.get('EC2ResourceDetails', {})
+                  return ec2_resource_details.get('InstanceType', '')
+              return ''
+
+          def lambda_handler(event, context):
+              # Set up the AWS Cost Explorer client
+              ce_client = boto3.client('ce')
+
+              # Specify the query for the rightsizing recommendations
+              rightsizing_query = {
+                  "Service": "AmazonEC2",
+                  "PageSize": 100
+              }
+
+              # Execute the rightsizing recommendations query with pagination
+              next_page_token = None
+              recommendations_list = []
+
+              while True:
+                  if next_page_token:
+                      rightsizing_query["NextPageToken"] = next_page_token
+
+                  response = ce_client.get_rightsizing_recommendation(**rightsizing_query)
+
+                  # Extract recommendations
+                  recommendations = response.get('RightsizingRecommendations', [])
+                  recommendations_list.extend(recommendations)
+
+                  # Check if there are more pages
+                  next_page_token = response.get('NextPageToken')
+                  if not next_page_token:
+                      break
+
+              # Flatten nested dictionaries
+              flattened_recommendations = [flatten_dict(recommendation) for recommendation in recommendations_list]
+
+              # Write detailed recommendations to CSV
+              detailed_csv_file_path = '/tmp/detailed_rightsizing_recommendations.csv'
+              with open(detailed_csv_file_path, mode='w', newline='') as detailed_csv_file:
+                  detailed_fieldnames = set(field for recommendation in flattened_recommendations for field in recommendation.keys())
+                  
+                  # Add 'AccountAlias' to the detailed fieldnames
+                  detailed_fieldnames.add('AccountAlias')
+
+                  detailed_writer = csv.DictWriter(detailed_csv_file, fieldnames=detailed_fieldnames)
+                  
+                  # Write header
+                  detailed_writer.writeheader()
+                  
+                  # Write data
+                  for recommendation in flattened_recommendations:
+                      # Add the account alias to each row
+                      account_id = recommendation.get('AccountId', '')
+                      account_alias = get_account_alias(account_id) if account_id else ''
+                      recommendation['AccountAlias'] = account_alias
+                      detailed_writer.writerow(recommendation)
+
+              print(f"Detailed CSV file created at: {detailed_csv_file_path}")
+
+              # Upload detailed CSV file to S3
+              s3 = boto3.client('s3')
+              detailed_bucket_name = os.environ ['BucketName']
+              detailed_s3_key = f'{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}-Detailed_rightsizing_recommendations.csv'
+              
+              s3.upload_file(detailed_csv_file_path, detailed_bucket_name, detailed_s3_key)
+
+              print(f"Detailed CSV file uploaded to S3://{detailed_bucket_name}/{detailed_s3_key}")
+
+              # Clean up: Delete the temporary detailed CSV file
+              os.remove(detailed_csv_file_path)
+              
+              # Generate presigned url
+              #try:
+              detailed_download_url = s3.generate_presigned_url(
+                  'get_object',
+                  Params={
+                      'Bucket': detailed_bucket_name,
+                      'Key': detailed_s3_key
+                      },
+                  ExpiresIn=43200
+              )
+              print('Detailed output download URL:' , detailed_download_url)
+
+              # Create summary CSV file
+              summary_csv_file_path = '/tmp/rightsizing_recommendations_summary.csv'
+              with open(summary_csv_file_path, mode='w', newline='') as summary_csv_file:
+                  summary_fieldnames = [
+                      'Instance Id',
+                      'Instance Name',
+                      'AWS Account Id',
+                      'AWS Account Alias',
+                      'Instance Region',
+                      'Rightsizing Type',
+                      'Finding Reason Codes',
+                      'Current Instance Type',
+                      'Recommended Instance Type',
+                      'Instance Platform',
+                      'Estimated Monthly Savings In USD'
+                  ]
+
+                  summary_writer = csv.DictWriter(summary_csv_file, fieldnames=summary_fieldnames)
+                  
+                  # Write header
+                  summary_writer.writeheader()
+
+                  # Write data
+                  for recommendation in flattened_recommendations:
+                      # Extract relevant fields for summary
+                      summary_data = {
+                          'Instance Id': recommendation.get('CurrentInstance_ResourceId', ''),
+                          'Instance Name': recommendation.get('CurrentInstance_InstanceName', ''),
+                          'AWS Account Id': recommendation.get('AccountId', ''),
+                          'AWS Account Alias': get_account_alias(recommendation.get('AccountId', '')),
+                          'Instance Region': recommendation.get('CurrentInstance_ResourceDetails_EC2ResourceDetails_Region', ''),
+                          'Rightsizing Type': recommendation.get('RightsizingType', ''),
+                          'Finding Reason Codes': recommendation.get('FindingReasonCodes', ''),
+                          'Current Instance Type': recommendation.get('CurrentInstance_ResourceDetails_EC2ResourceDetails_InstanceType', ''),
+                          'Recommended Instance Type': extract_instance_type_from_target_instances(recommendation.get('ModifyRecommendationDetail_TargetInstances', [])),
+                          'Instance Platform': recommendation.get('CurrentInstance_ResourceDetails_EC2ResourceDetails_Platform', ''),
+                          'Estimated Monthly Savings In USD': extract_savings_from_target_instances(recommendation.get('ModifyRecommendationDetail_TargetInstances', []))
+                      }
+                      summary_writer.writerow(summary_data)
+
+              print(f"Summary CSV file created at: {summary_csv_file_path}")
+
+              # Upload summary CSV file to S3
+              summary_bucket_name = os.environ ['BucketName']
+              summary_s3_key = f'{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}-Summarized_rightsizing_recommendations.csv'
+              
+              s3.upload_file(summary_csv_file_path, summary_bucket_name, summary_s3_key)
+
+              print(f"Summary CSV file uploaded to S3://{summary_bucket_name}/{summary_s3_key}")
+
+              # Clean up: Delete the temporary summary CSV file
+              os.remove(summary_csv_file_path)
+              
+              # Generate presigned url
+              #try:
+              summarized_download_url = s3.generate_presigned_url(
+                  'get_object',
+                  Params={
+                      'Bucket': summary_bucket_name,
+                      'Key': summary_s3_key
+                      },
+                  ExpiresIn=43200
+              )
+              print('Summarized output download URL:' , summarized_download_url)
+
+              message = "A new AWS rightsizing recommendation report is available, click on the following links to download. \n NOTE: These URLs expires in 12 hours. For previous reports please contact the Information Security & Governance Team. \n \n Detailed report:  %s \n \n Summarized report:  %s \n \n " % (detailed_download_url, summarized_download_url)
+              response = sns.publish(
+                  TopicArn = os.environ ['SnsTopicArn'] ,
+                  Subject = "New monthly AWS rightsizing recommendation reports.",
+                  Message = message
+              )
+      Handler: "index.lambda_handler"
+      Environment:
+       Variables:
+          SnsTopicArn: !Ref RightsizingSnsTopic
+          BucketName: !Ref RightsizingBucketName
+      MemorySize: 512
+      Role: 
+        Fn::GetAtt:
+        - RightsizingLambdaExecutionRole
+        - Arn
+      Runtime: "python3.9"
+      Timeout: 300
+
+  RightsizingReportsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Ref RightsizingEventBridge
+      Description: "Triggers lambda function on a schedule to create Rightsizing reports"
+      EventBusName: default
+      ScheduleExpression: "cron(0 21 ? * sun#1 *)"
+      State: "ENABLED"
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+            - RightsizingLambdaFunction
+            - Arn
+          Id: "RightsizingLambdaTarget"
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "RightsizingLambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+        - RightsizingReportsRule
+        - Arn
