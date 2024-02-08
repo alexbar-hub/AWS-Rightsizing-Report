@@ -5,6 +5,7 @@ Generate Rightsizing Recommendation reportss on a schedule, save 2 CSVs in S3 an
   - [Intro](#intro)
   - [What it does](#what-it-does)
   - [Deployment](#deployment)
+- [License](#license)
 
 
 ## Intro
@@ -32,4 +33,7 @@ In order to deploy this template:
 * open CloudFormation in the billing account;
 * populate all the required fields above;
 * submit;
+
+# License
+See license.
 
